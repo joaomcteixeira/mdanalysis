@@ -25,9 +25,9 @@
 PDBx/mmCIF Topology Parser
 =========================================================================
 
-This topology parser uses a standard PDBx/mmCIF file to build an internal 
+This topology parser uses a standard PDBx/mmCIF file to build an internal
 structure representation (list of atoms). Optionally parses bonds, box vectors,
-and others if these are present in the file. Useful when dealing with very 
+and others if these are present in the file. Useful when dealing with very
 large files that break the PDB format (>9,999 residues or >99,999 atoms).
 
 .. Note::
@@ -49,6 +49,9 @@ Classes
 
 """
 from __future__ import absolute_import, print_function
+
+import collections
+import re
 
 import numpy as np
 import warnings
@@ -76,6 +79,7 @@ from ..core.topologyattrs import (
     Segids,
     Tempfactors,
 )
+
 
 def float_or_default(val, default):
     try:
@@ -107,7 +111,7 @@ class PDBxParser(TopologyReaderBase):
          - resnum
 
         Segments:
-         - segid
+         - segid  # same as chainid if present
          - model
 
     Guesses the following Attributes:
@@ -125,44 +129,104 @@ class PDBxParser(TopologyReaderBase):
         -------
         MDAnalysis Topology object
         """
-        top = self._parseatoms()
+        top = self._parse_atoms()
 
-        try:
-            bonds = self._parsebonds(top.ids.values)
-        except AttributeError:
-            warnings.warn("Invalid atom serials were present, "
-                          "bonds will not be parsed")
-        else:
-            top.add_TopologyAttr(bonds)
+        # try:
+        #     bonds = self._parsebonds(top.ids.values)
+        # except AttributeError:
+        #     warnings.warn("Invalid atom serials were present, "
+        #                   "bonds will not be parsed")
+        # else:
+        #     top.add_TopologyAttr(bonds)
 
         return top
 
-    def _parseatoms(self):
-        """Create the initial Topology object"""
-        resid_prev = 0  # resid looping hack
+    def _tokenize_pdbx_line(self, line):
+        """Separates a PDBx/mmCIF line by whitespace respecting quoted fields.
+        """
+        # TODO: Move compiled regex to global scope
 
-        # Field Indexes
-        # To be populated on reading _atom_site.xxx entries
-        i_rectype = None
-        i_serial = None
-        i_atmtype = None
-        i_atmname_label = None
-        i_atmname_auth = None
-        i_altloc = None
-        i_resname_label = None
-        i_resname_auth = None
-        i_chainid_label = None
-        i_chainid_auth = None
-        i_resid_label = None
-        i_resid_auth = None
-        i_icode = None
-        i_coordx = None
-        i_coordy = None
-        i_coordz = None
-        i_occupancy = None
-        i_tempfactor = None
-        i_charge = None
-        i_modelid = None
+        # Split by unquoted whitespace
+        regex = re.compile(r'''
+                            '.*?' | # single quoted substring OR
+                            ".*?" | # double quoted substring OR
+                            \S+     # any consec. non-whitespace character(s)
+                            ''', re.VERBOSE)
+        raw_tokens = regex.findall(line)
+
+        # Remove quotes from tokens
+        re_dequote = re.compile(r'''
+                                 ^' | '$ |
+                                 ^" | "$
+                                ''', re.VERBOSE)
+        dequoted_tokens = [re_dequote.sub('', t) for t in raw_tokens]
+
+        # Convert '.' and '?' to None
+        return [None if t in set(('.', '?')) else t for t in dequoted_tokens]
+
+    def _auth_or_label(self, vlist, atom_label):
+        """Returns _label_X if any value in _auth_X is None."""
+        if any(e is None for e in vlist[atom_label]):  # lazy
+            return vlist[atom_label.replace('_auth', '_label')]
+        return vlist[atom_label]
+
+    def _read_datatables(self, fhandle, table=None, start_line_idx=0):
+        """Parses data from PDBx/mmCIF tables.
+
+        Parameters
+        ----------
+        fhandle : file
+            open file handle.
+        table: str
+            names of table to read (e.g. '_atom_site' or '_cell').
+            None (default value) reads all tables.
+        start_line_idx : int
+            line number increment to add to error reporting messages.
+
+        Returns
+        -------
+        dictionary with labels as keys and data as values.
+        """
+
+        # ['atom_site']['group_PDB']: ['ATOM', 'ATOM' ...]'
+        pdbx_tbl = collections.defaultdict(dict)
+        # 0: 'group_PDB'
+        idx_to_item = {}
+        _i = 0
+
+        read_data = False
+        open_table = False
+        for line_idx, line in enumerate(fhandle, start=start_line_idx + 1):
+            line = line.strip()
+            if line == 'loop_':
+                open_table = True
+            elif not line or line == '#':
+                open_table = False
+                read_data = False
+                # Reset indexers
+                idx_to_item.clear()
+                _i = 0
+            elif line[0] == '_' and open_table:  # read labels
+                if table is None or line.startswith(table):
+                    cat, item = line.split('.')
+                    pdbx_tbl[cat][item] = []
+                    idx_to_item[_i] = item
+                    _i += 1
+                    read_data = True
+            elif read_data:
+                tokens = self._tokenize_pdbx_line(line)
+                if len(tokens) != len(idx_to_item):
+                    raise ValueError("Number of tokens on line {} in file '{}'"
+                                     " does not match expected value: {}, {}"
+                                     "".format(line_idx, self.filename,
+                                               len(tokens), len(idx_to_item)))
+                for idx_t, t in enumerate(tokens):
+                    pdbx_tbl[cat][idx_to_item[idx_t]].append(t)
+
+        return pdbx_tbl
+
+    def _parse_atoms(self):
+        """Create the initial Topology object"""
 
         # Storage
         record_types = []
@@ -176,89 +240,56 @@ class PDBxParser(TopologyReaderBase):
         tempfactors = []
         occupancies = []
         atomtypes = []
+        charges = []
 
         resids = []
         resnames = []
-
         segids = []
 
         with util.openany(self.filename) as f:
 
-            # Ensure first non-comment line is 'data_'
-            for line in f:
+            # Skip initial comments
+            for idx_line, line in enumerate(f, start=1):
                 line = line.strip()
                 if line.startswith('#'):
                     continue
                 else:
                     break
 
-            if line != 'data_':
-                raise ValueError("Bad format in file '{}':"
-                                 "First non-comment line should start with "
-                                 "'_data'. Found '{}' instead."
-                                 "".format(self.filename line))
+            # Ensure we open a data block
+            if not line.startswith('data_'):
+                raise ValueError("Unexpected field in file '{}' on line {}: {}."
+                                 " First non-comment line must open a data"
+                                 " block ('data_xxx')."
+                                 "".format(self.filename, idx_line, line))
 
-            # Continue reading the file until we find the coord loop
-            for line in f:
-                line = line.strip()  # Remove extra spaces
-                if not line or line.startswith('#'):  # Skip if empty/comment
-                    continue
+            # Continue reading the file and read _atom_site table
+            tbl = self._read_datatables(f, '_atom_site', idx_line)
 
+        # Iterate over table data and convert fields where needed
+        # e.g. resid -> int; occupancy -> float
+        # When possible, prefer _auth. If None, default to _label.
+        record_types = tbl['_atom_site']['group_PDB']
+        serials = list(map(int, tbl['_atom_site']['id']))
+        atomtypes = tbl['_atom_site']['type_symbol']
+        names = self._auth_or_label(tbl['_atom_site'], 'auth_atom_id')
+        altlocs = tbl['_atom_site']['label_alt_id']
+        resnames = self._auth_or_label(tbl['_atom_site'], 'auth_comp_id')
+        chainids = self._auth_or_label(tbl['_atom_site'], 'auth_asym_id')
+        _resids = self._auth_or_label(tbl['_atom_site'], 'auth_seq_id')
+        resids = list(map(int, _resids))
+        icodes = tbl['_atom_site']['pdbx_PDB_ins_code']
+        occupancies = list(map(float, tbl['_atom_site']['occupancy']))
+        tempfactors = list(map(float, tbl['_atom_site']['B_iso_or_equiv']))
 
+        # If charges are all present, add them.
+        _charges = tbl['_atom_site']['pdbx_formal_charge']
+        if all(_charges):  # lazy
+            charges = list(map(float, _charges))
 
-                record_types.append(line[:6].strip())
-                try:
-                    serial = int(line[6:11])
-                except:
-                    try:
-                        serial = hy36decode(5, line[6:11])
-                    except ValueError:
-                        # serial can become '***' when they get too high
-                        self._wrapped_serials = True
-                        serial = last_wrapped_serial
-                        last_wrapped_serial += 1
-                finally:
-                    serials.append(serial)
-
-                names.append(line[12:16].strip())
-                altlocs.append(line[16:17].strip())
-                resnames.append(line[17:21].strip())
-                chainids.append(line[21:22].strip())
-
-                # Resids are optional
-                try:
-                    if self.format == "XPDB":  # fugly but keeps code DRY
-                        # extended non-standard format used by VMD
-                        resid = int(line[22:27])
-                    else:
-                        resid = int(line[22:26])
-                        # Wrapping
-                        while resid - resid_prev < -5000:
-                            resid += 10000
-                        resid_prev = resid
-                except ValueError:
-                    warnings.warn("PDB file is missing resid information.  "
-                                  "Defaulted to '1'")
-                    resid = 1
-                    icode = ''
-                finally:
-                    resids.append(resid)
-                    icodes.append(line[26:27].strip())
-
-                occupancies.append(float_or_default(line[54:60], 0.0))
-                tempfactors.append(float_or_default(line[60:66], 1.0))  # AKA bfactor
-
-                segids.append(line[66:76].strip())
-                atomtypes.append(line[76:78].strip())
-
-        # Warn about wrapped serials
-        if self._wrapped_serials:
-            warnings.warn("Serial numbers went over 100,000.  "
-                          "Higher serials have been guessed")
-
-        # If segids not present, try to use chainids
-        if not any(segids):
-            segids, chainids = chainids, None
+        # If chains are present, use also as segids
+        # Should always be. Either _auth or _label
+        segids = chainids
 
         n_atoms = len(serials)
 
@@ -273,12 +304,12 @@ class PDBxParser(TopologyReaderBase):
                 (tempfactors, Tempfactors, np.float32),
                 (occupancies, Occupancies, np.float32),
         ):
-            if not vals is None:
-                attrs.append(Attr(np.array(vals, dtype=dtype)))
-        # Guessed attributes
-        # masses from types if they exist
-        # OPT: We do this check twice, maybe could refactor to avoid this
-        if not any(atomtypes):
+            attrs.append(Attr(np.array(vals, dtype=dtype)))
+
+        # Guessed attributes:
+        #   - types from names if any is missing
+        #   - masses from types
+        if any(e is None for e in atomtypes):
             atomtypes = guess_types(names)
             attrs.append(Atomtypes(atomtypes, guessed=True))
         else:
@@ -290,8 +321,6 @@ class PDBxParser(TopologyReaderBase):
         # Residue level stuff from here
         resids = np.array(resids, dtype=np.int32)
         resnames = np.array(resnames, dtype=object)
-        if self.format == 'XPDB':  # XPDB doesn't have icodes
-            icodes = [''] * n_atoms
         icodes = np.array(icodes, dtype=object)
         resnums = resids.copy()
         segids = np.array(segids, dtype=object)
@@ -305,14 +334,11 @@ class PDBxParser(TopologyReaderBase):
         attrs.append(ICodes(icodes))
         attrs.append(Resnames(resnames))
 
-        if any(segids) and not any(val == None for val in segids):
-            segidx, (segids,) = change_squash((segids,), (segids,))
-            n_segments = len(segids)
-            attrs.append(Segids(segids))
-        else:
-            n_segments = 1
-            attrs.append(Segids(np.array(['SYSTEM'], dtype=object)))
-            segidx = None
+        # _atom_site.label_asym_id should *always* be there
+        # so we can safely avoid the check.
+        segidx, (segids,) = change_squash((segids,), (segids,))
+        n_segments = len(segids)
+        attrs.append(Segids(segids))
 
         top = Topology(n_atoms, n_residues, n_segments,
                        attrs=attrs,
@@ -321,77 +347,34 @@ class PDBxParser(TopologyReaderBase):
 
         return top
 
-    def _parsebonds(self, serials):
-        # Could optimise this by saving lines in the main loop
-        # then doing post processing after all Atoms have been read
-        # ie do one pass through the file only
-        # Problem is that in multiframe PDB, the CONECT is at end of file,
-        # so the "break" call happens before bonds are reached.
+    # def _parsebonds(self, serials):
+    #     # Could optimise this by saving lines in the main loop
+    #     # then doing post processing after all Atoms have been read
+    #     # ie do one pass through the file only
+    #     # Problem is that in multiframe PDB, the CONECT is at end of file,
+    #     # so the "break" call happens before bonds are reached.
 
-        # If the serials wrapped, this won't work
-        if self._wrapped_serials:
-            warnings.warn("Invalid atom serials were present, bonds will not"
-                          " be parsed")
-            raise AttributeError  # gets caught in parse
+    #     # Mapping between the atom array indicies a.index and atom ids
+    #     # (serial) in the original PDB file
+    #     mapping = dict((s, i) for i, s in enumerate(serials))
 
-        # Mapping between the atom array indicies a.index and atom ids
-        # (serial) in the original PDB file
-        mapping = dict((s, i) for i, s in enumerate(serials))
+    #     bonds = set()
+    #     with util.openany(self.filename) as f:
+    #         lines = (line for line in f if line[:6] == "CONECT")
+    #         for line in lines:
+    #             atom, atoms = _parse_conect(line.strip())
+    #             for a in atoms:
+    #                 try:
+    #                     bond = tuple([mapping[atom], mapping[a]])
+    #                 except KeyError:
+    #                     # Bonds to TER records have no mapping
+    #                     # Ignore these as they are not real atoms
+    #                     warnings.warn(
+    #                         "PDB file contained CONECT record to TER entry. "
+    #                         "These are not included in bonds.")
+    #                 else:
+    #                     bonds.add(bond)
 
-        bonds = set()
-        with util.openany(self.filename) as f:
-            lines = (line for line in f if line[:6] == "CONECT")
-            for line in lines:
-                atom, atoms = _parse_conect(line.strip())
-                for a in atoms:
-                    try:
-                        bond = tuple([mapping[atom], mapping[a]])
-                    except KeyError:
-                        # Bonds to TER records have no mapping
-                        # Ignore these as they are not real atoms
-                        warnings.warn(
-                            "PDB file contained CONECT record to TER entry. "
-                            "These are not included in bonds.")
-                    else:
-                        bonds.add(bond)
+    #     bonds = tuple(bonds)
 
-        bonds = tuple(bonds)
-
-        return Bonds(bonds)
-
-
-def _parse_conect(conect):
-    """parse a CONECT record from pdbs
-
-    Parameters
-    ----------
-    conect : str
-        white space striped CONECT record
-
-    Returns
-    -------
-    atom_id : int
-        atom index of bond
-    bonds : set
-        atom ids of bonded atoms
-
-    Raises
-    ------
-    RuntimeError
-        Raised if ``conect`` is not a valid CONECT record
-    """
-    atom_id = np.int(conect[6:11])
-    n_bond_atoms = len(conect[11:]) // 5
-
-    try:
-        if len(conect[11:]) % n_bond_atoms != 0:
-            raise RuntimeError("Bond atoms aren't aligned proberly for CONECT "
-                               "record: {}".format(conect))
-    except ZeroDivisionError:
-        # Conect record with only one entry (CONECT A\n)
-        warnings.warn("Found CONECT record with single entry, ignoring this")
-        return atom_id, []  # return empty list to allow iteration over nothing
-
-    bond_atoms = (int(conect[11 + i * 5: 16 + i * 5]) for i in
-                  range(n_bond_atoms))
-    return atom_id, bond_atoms
+    #     return Bonds(bonds)
