@@ -56,7 +56,6 @@ import re
 import numpy as np
 import warnings
 
-from six.moves import range
 from .guessers import guess_masses, guess_types
 from ..lib import util
 from .base import TopologyReaderBase, change_squash
@@ -66,7 +65,6 @@ from ..core.topologyattrs import (
     Atomids,
     AltLocs,
     Bonds,
-    ChainIDs,
     Atomtypes,
     ICodes,
     Masses,
@@ -79,13 +77,6 @@ from ..core.topologyattrs import (
     Segids,
     Tempfactors,
 )
-
-
-def float_or_default(val, default):
-    try:
-        return float(val)
-    except ValueError:
-        return default
 
 
 class PDBxParser(TopologyReaderBase):
@@ -101,7 +92,8 @@ class PDBxParser(TopologyReaderBase):
          - masses (guessed)
          - name
          - occupancy
-         - type (guessed)
+         - type
+         - elements (guess)
          - bonds (from _struct_conn)
 
         Residues:
@@ -111,64 +103,42 @@ class PDBxParser(TopologyReaderBase):
          - resnum
 
         Segments:
-         - segid  # same as chainid if present
-         - model
+         - segid  # taken from chain ids
 
     Guesses the following Attributes:
      - masses
-     - types
+     - types, if missing
+     - elements
 
     .. versionadded:: 0.x
     """
-    format = ['CIF`', 'MMCIF']
+    format = ['CIF', 'MMCIF']
 
     def parse(self, **kwargs):
-        """Parse atom information from PDBx/mmCIF file
+        """Parse atom and bond information from PDBx/mmCIF file
 
         Returns
         -------
         MDAnalysis Topology object
         """
-        top = self._parse_atoms()
 
-        # try:
-        #     bonds = self._parsebonds(top.ids.values)
-        # except AttributeError:
-        #     warnings.warn("Invalid atom serials were present, "
-        #                   "bonds will not be parsed")
-        # else:
-        #     top.add_TopologyAttr(bonds)
-
-        return top
+        return self._parse_atom_n_bonding_data()
 
     def _tokenize_pdbx_line(self, line):
         """Separates a PDBx/mmCIF line by whitespace respecting quoted fields.
         """
-        # TODO: Move compiled regex to global scope
 
         # Split by unquoted whitespace
+        # Use grouping to remove quotes from final output
+        # Join groups: two will be empty, one won't.
         regex = re.compile(r'''
-                            '.*?' | # single quoted substring OR
-                            ".*?" | # double quoted substring OR
-                            \S+     # any consec. non-whitespace character(s)
+                            '(.*?)' | # single quoted substring OR
+                            "(.*?)" | # double quoted substring OR
+                            (\S+)     # any consec. non-whitespace character(s)
                             ''', re.VERBOSE)
-        raw_tokens = regex.findall(line)
-
-        # Remove quotes from tokens
-        re_dequote = re.compile(r'''
-                                 ^' | '$ |
-                                 ^" | "$
-                                ''', re.VERBOSE)
-        dequoted_tokens = [re_dequote.sub('', t) for t in raw_tokens]
-
-        # Convert '.' and '?' to None
-        return [None if t in set(('.', '?')) else t for t in dequoted_tokens]
-
-    def _auth_or_label(self, vlist, atom_label):
-        """Returns _label_X if any value in _auth_X is None."""
-        if any(e is None for e in vlist[atom_label]):  # lazy
-            return vlist[atom_label.replace('_auth', '_label')]
-        return vlist[atom_label]
+        raw_tokens = [''.join(t) for t in regex.findall(line)]
+        # Convert '.' and '?' to empty strings
+        return ['' if t in set(('.', '?')) else t for t in raw_tokens]
 
     def _read_datatables(self, fhandle, table=None, start_line_idx=0):
         """Parses data from PDBx/mmCIF tables.
@@ -178,7 +148,7 @@ class PDBxParser(TopologyReaderBase):
         fhandle : file
             open file handle.
         table: str
-            names of table to read (e.g. '_atom_site' or '_cell').
+            name of table to read (e.g. '_atom_site' or '_cell').
             None (default value) reads all tables.
         start_line_idx : int
             line number increment to add to error reporting messages.
@@ -187,6 +157,8 @@ class PDBxParser(TopologyReaderBase):
         -------
         dictionary with labels as keys and data as values.
         """
+
+        _tokenizer_func = self._tokenize_pdbx_line  # local scope
 
         # ['atom_site']['group_PDB']: ['ATOM', 'ATOM' ...]'
         pdbx_tbl = collections.defaultdict(dict)
@@ -214,7 +186,7 @@ class PDBxParser(TopologyReaderBase):
                     _i += 1
                     read_data = True
             elif read_data:
-                tokens = self._tokenize_pdbx_line(line)
+                tokens = _tokenizer_func(line)
                 if len(tokens) != len(idx_to_item):
                     raise ValueError("Number of tokens on line {} in file '{}'"
                                      " does not match expected value: {}, {}"
@@ -223,10 +195,36 @@ class PDBxParser(TopologyReaderBase):
                 for idx_t, t in enumerate(tokens):
                     pdbx_tbl[cat][idx_to_item[idx_t]].append(t)
 
+        if not pdbx_tbl:
+            table = 'any' if table is None else table
+            raise AttributeError("Could not find '{}' table in file '{}'"
+                                 "".format(table, self.filename))
+
         return pdbx_tbl
 
-    def _parse_atoms(self):
-        """Create the initial Topology object"""
+    def _auth_or_label(self, vlist, atom_label):
+        """Returns _label_X if any value in _auth_X is empty/False."""
+        if all(vlist[atom_label]):  # lazy
+            return vlist[atom_label]
+        return vlist[atom_label.replace('_auth', '_label')]
+
+    def _squash_models(self, atom_tbl):
+        """Returns a new PDBx _atom_site table containing only entries
+        belonging to the first model"""
+
+        models = list(map(int, atom_tbl['pdbx_PDB_model_num']))
+        model_idx = models[0]
+
+        # Models should be contiguous, but just in case
+        at_idx_model = set((i for i, m in enumerate(models) if m == model_idx))
+
+        # Filter _atom_site entries
+        for key, data in atom_tbl.items():
+            atom_tbl[key] = [d for i, d in enumerate(data) if i in at_idx_model]
+        return atom_tbl
+
+    def _parse_atom_n_bonding_data(self):
+        """Create and populate a Topology object with atom and bonding data."""
 
         # Storage
         record_types = []
@@ -235,7 +233,6 @@ class PDBxParser(TopologyReaderBase):
         serials = []
         names = []
         altlocs = []
-        chainids = []
         icodes = []
         tempfactors = []
         occupancies = []
@@ -246,6 +243,13 @@ class PDBxParser(TopologyReaderBase):
         resnames = []
         segids = []
 
+        # To map bonds to atoms we need to use the _label data, which may
+        # or may not be used to populate the topology. As such, it's simpler
+        # to just read the file twice in a row to get the two datablocks
+        # we need. Unsure if util.openany objects always have a .seek() method
+        # otherwise we'd just rewind...
+        #
+        # Round 1: read atoms
         with util.openany(self.filename) as f:
 
             # Skip initial comments
@@ -263,33 +267,55 @@ class PDBxParser(TopologyReaderBase):
                                  " block ('data_xxx')."
                                  "".format(self.filename, idx_line, line))
 
-            # Continue reading the file and read _atom_site table
+            # Continue reading the file and read atom table
             tbl = self._read_datatables(f, '_atom_site', idx_line)
+            tbl_atom_data = tbl['_atom_site']
+        #
+        # Round 2: read bonds; no need to do checks
+        # May or may not have bonds!
+        with util.openany(self.filename) as f:
+            try:
+                tbl = self._read_datatables(f, '_struct_conn', 0)
+            except AttributeError:
+                tbl_bond_data = {}
+            else:
+                tbl_bond_data = tbl['_struct_conn']
+
+        #
+        # Populate Topology
+        #
+
+        # PDBx/mmCIF can have multiple models, all sharing exactly the same
+        # atoms and residues and chains. For topology purposes, we can use
+        # only the first one.
+        models = list(map(int, tbl_atom_data['pdbx_PDB_model_num']))
+
+        if len(set(models)) > 1:
+            warnings.warn("File '{}' contains multiple models, will only"
+                          " consider the first when building Topology."
+                          "".format(self.filename))
+            tbl_atom_data = self._squash_models(tbl_atom_data)
 
         # Iterate over table data and convert fields where needed
         # e.g. resid -> int; occupancy -> float
         # When possible, prefer _auth. If None, default to _label.
-        record_types = tbl['_atom_site']['group_PDB']
-        serials = list(map(int, tbl['_atom_site']['id']))
-        atomtypes = tbl['_atom_site']['type_symbol']
-        names = self._auth_or_label(tbl['_atom_site'], 'auth_atom_id')
-        altlocs = tbl['_atom_site']['label_alt_id']
-        resnames = self._auth_or_label(tbl['_atom_site'], 'auth_comp_id')
-        chainids = self._auth_or_label(tbl['_atom_site'], 'auth_asym_id')
-        _resids = self._auth_or_label(tbl['_atom_site'], 'auth_seq_id')
+        record_types = tbl_atom_data['group_PDB']
+        serials = list(map(int, tbl_atom_data['id']))
+        atomtypes = tbl_atom_data['type_symbol']
+        names = self._auth_or_label(tbl_atom_data, 'auth_atom_id')
+        altlocs = tbl_atom_data['label_alt_id']
+        resnames = self._auth_or_label(tbl_atom_data, 'auth_comp_id')
+        segids = self._auth_or_label(tbl_atom_data, 'auth_asym_id')
+        _resids = self._auth_or_label(tbl_atom_data, 'auth_seq_id')
         resids = list(map(int, _resids))
-        icodes = tbl['_atom_site']['pdbx_PDB_ins_code']
-        occupancies = list(map(float, tbl['_atom_site']['occupancy']))
-        tempfactors = list(map(float, tbl['_atom_site']['B_iso_or_equiv']))
+        icodes = tbl_atom_data['pdbx_PDB_ins_code']
+        occupancies = list(map(float, tbl_atom_data['occupancy']))
+        tempfactors = list(map(float, tbl_atom_data['B_iso_or_equiv']))
 
         # If charges are all present, add them.
-        _charges = tbl['_atom_site']['pdbx_formal_charge']
-        if all(_charges):  # lazy
-            charges = list(map(float, _charges))
-
-        # If chains are present, use also as segids
-        # Should always be. Either _auth or _label
-        segids = chainids
+        charges = tbl_atom_data['pdbx_formal_charge']
+        if all(charges):  # lazy
+            charges = list(map(float, charges))
 
         n_atoms = len(serials)
 
@@ -298,7 +324,6 @@ class PDBxParser(TopologyReaderBase):
         for vals, Attr, dtype in (
                 (names, Atomnames, object),
                 (altlocs, AltLocs, object),
-                (chainids, ChainIDs, object),
                 (record_types, RecordTypes, object),
                 (serials, Atomids, np.int32),
                 (tempfactors, Tempfactors, np.float32),
@@ -309,14 +334,18 @@ class PDBxParser(TopologyReaderBase):
         # Guessed attributes:
         #   - types from names if any is missing
         #   - masses from types
-        if any(e is None for e in atomtypes):
+        #   - elements from types
+        if all(atomtypes):
+            attrs.append(Atomtypes(np.array(atomtypes, dtype=object)))
+        else:
             atomtypes = guess_types(names)
             attrs.append(Atomtypes(atomtypes, guessed=True))
-        else:
-            attrs.append(Atomtypes(np.array(atomtypes, dtype=object)))
 
         masses = guess_masses(atomtypes)
         attrs.append(Masses(masses, guessed=True))
+
+        elements = guess_types(atomtypes)
+        attrs.append(Elements(elements, guessed=True))
 
         # Residue level stuff from here
         resids = np.array(resids, dtype=np.int32)
@@ -326,55 +355,52 @@ class PDBxParser(TopologyReaderBase):
         segids = np.array(segids, dtype=object)
 
         residx, (resids, resnames, icodes, resnums, segids) = change_squash(
-            (resids, resnames, icodes, segids), (resids, resnames, icodes, resnums, segids))
+            (resids, resnames, icodes, segids),
+            (resids, resnames, icodes, resnums, segids))
+
         n_residues = len(resids)
+
         attrs.append(Resnums(resnums))
         attrs.append(Resids(resids))
         attrs.append(Resnums(resids.copy()))
         attrs.append(ICodes(icodes))
         attrs.append(Resnames(resnames))
 
-        # _atom_site.label_asym_id should *always* be there
-        # so we can safely avoid the check.
+        # Segments
         segidx, (segids,) = change_squash((segids,), (segids,))
         n_segments = len(segids)
         attrs.append(Segids(segids))
 
-        top = Topology(n_atoms, n_residues, n_segments,
-                       attrs=attrs,
-                       atom_resindex=residx,
-                       residue_segindex=segidx)
+        # Bonds
+        if tbl_bond_data:
+            # Make mapping of (asym, comp, seq, atom) to atom index
+            # simplify and use label_X only as this is guaranteed to exist.
+            atom_mapping = {}
+            for idx, ziptup in enumerate(zip(tbl_atom_data['label_asym_id'],
+                                             tbl_atom_data['label_comp_id'],
+                                             tbl_atom_data['label_seq_id'],
+                                             tbl_atom_data['label_atom_id'])):
+                atom_mapping[ziptup] = idx
 
-        return top
+            bonds = []
+            for idx, b in enumerate(zip(tbl_bond_data['ptnr1_label_asym_id'],
+                                        tbl_bond_data['ptnr1_label_comp_id'],
+                                        tbl_bond_data['ptnr1_label_seq_id'],
+                                        tbl_bond_data['ptnr1_label_atom_id'],
+                                        tbl_bond_data['ptnr2_label_asym_id'],
+                                        tbl_bond_data['ptnr2_label_comp_id'],
+                                        tbl_bond_data['ptnr2_label_seq_id'],
+                                        tbl_bond_data['ptnr2_label_atom_id'])):
 
-    # def _parsebonds(self, serials):
-    #     # Could optimise this by saving lines in the main loop
-    #     # then doing post processing after all Atoms have been read
-    #     # ie do one pass through the file only
-    #     # Problem is that in multiframe PDB, the CONECT is at end of file,
-    #     # so the "break" call happens before bonds are reached.
+                atomA, atomB = atom_mapping.get(b[:4]), atom_mapping.get(b[4:])
+                if atomA is None or atomB is None:
+                    warnings.warn("Could not map bond #{} to any known atom."
+                                  "".format(idx))
+                    continue
+                bonds.append((atomA, atomB))
+            attrs.append(Bonds(set(bonds)))
 
-    #     # Mapping between the atom array indicies a.index and atom ids
-    #     # (serial) in the original PDB file
-    #     mapping = dict((s, i) for i, s in enumerate(serials))
-
-    #     bonds = set()
-    #     with util.openany(self.filename) as f:
-    #         lines = (line for line in f if line[:6] == "CONECT")
-    #         for line in lines:
-    #             atom, atoms = _parse_conect(line.strip())
-    #             for a in atoms:
-    #                 try:
-    #                     bond = tuple([mapping[atom], mapping[a]])
-    #                 except KeyError:
-    #                     # Bonds to TER records have no mapping
-    #                     # Ignore these as they are not real atoms
-    #                     warnings.warn(
-    #                         "PDB file contained CONECT record to TER entry. "
-    #                         "These are not included in bonds.")
-    #                 else:
-    #                     bonds.add(bond)
-
-    #     bonds = tuple(bonds)
-
-    #     return Bonds(bonds)
+        return Topology(n_atoms, n_residues, n_segments,
+                        attrs=attrs,
+                        atom_resindex=residx,
+                        residue_segindex=segidx)
