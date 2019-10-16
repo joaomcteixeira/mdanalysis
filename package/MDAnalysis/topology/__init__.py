@@ -304,3 +304,4 @@ from . import HoomdXMLParser
 from . import MMTFParser
 from . import GSDParser
 from . import MinimalParser
+from . import PDBxParser
